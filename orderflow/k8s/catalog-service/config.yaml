@@ -1,0 +1,20 @@
+# Non-sensitive configuration.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: catalog-config
+data:
+  db-url: jdbc:postgresql://catalog-db:5432/catalog
+  db-user: catalog
+  ORDERFLOW_CATALOG_MAX_PAGE_SIZE: "100"
+---
+# Sensitive configuration. NOTE: a Kubernetes Secret is base64, NOT encryption — anyone who can
+# read the object can read the value. Real clusters use Sealed Secrets, External Secrets or
+# Vault; this file exists so the manifest is complete for the local kind cluster (Session 14).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: catalog-secrets
+type: Opaque
+stringData:
+  db-password: dev-catalog-password

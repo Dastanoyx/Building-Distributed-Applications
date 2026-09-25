@@ -1,0 +1,138 @@
+# ---------------------------------------------------------------------------
+# Order service configuration.
+# Every environment-specific value comes from an environment variable with a local default.
+# ---------------------------------------------------------------------------
+spring:
+  application:
+    name: order-service
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/orders}
+    username: ${DB_USER:orders}
+    password: ${DB_PASSWORD:dev-order-password}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+      connection-timeout: 2000
+      leak-detection-threshold: 20000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+
+  flyway:
+    enabled: true
+
+  threads:
+    virtual:
+      enabled: true
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all                       # wait for every in-sync replica (Session 08)
+      retries: 5
+      properties:
+        enable.idempotence: true      # the producer's own retries cannot duplicate a record
+        delivery.timeout.ms: 120000
+    consumer:
+      group-id: order-service-saga
+      auto-offset-reset: earliest     # a new group reads the history rather than skipping it
+      enable-auto-commit: false       # commit AFTER processing: losing an event is worse than a duplicate
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      properties:
+        max.poll.records: 50
+    listener:
+      ack-mode: record
+      concurrency: 3                  # at most one thread per partition
+
+server:
+  port: ${PORT:8082}
+  shutdown: graceful
+
+orderflow:
+  catalog:
+    base-url: ${CATALOG_URL:http://localhost:8081}
+    connect-timeout: 500ms            # either the service is there or it is not
+    read-timeout: 2s                  # derived from the observed p99, not from a round number
+  outbox:
+    drain-interval-ms: 500
+    batch-size: 100
+  saga:
+    sweep-interval-ms: 30000
+
+# ---------------------------------------------------------------------------
+# Resilience4j — the policy, written where anyone can read it (Session 06).
+# ---------------------------------------------------------------------------
+resilience4j:
+  retry:
+    instances:
+      catalog:
+        max-attempts: 3
+        wait-duration: 100ms
+        exponential-backoff-multiplier: 2      # 100 ms, 200 ms, 400 ms
+        randomized-wait-factor: 0.5            # jitter, so callers do not retry in lockstep
+        retry-exceptions:
+          - java.io.IOException
+          - org.springframework.web.client.ResourceAccessException
+          - dev.orderflow.order.client.CatalogExceptions$CatalogUnavailable
+        ignore-exceptions:                     # business answers are never retried
+          - dev.orderflow.order.client.CatalogExceptions$StockUnavailable
+          - dev.orderflow.order.client.CatalogExceptions$ProductNotFound
+
+  circuitbreaker:
+    instances:
+      catalog:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 20
+        minimum-number-of-calls: 10            # do not judge a dependency on two calls
+        failure-rate-threshold: 50
+        slow-call-duration-threshold: 1s
+        slow-call-rate-threshold: 60
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+        register-health-indicator: true
+
+  bulkhead:
+    instances:
+      catalog:
+        max-concurrent-calls: 20               # one dependency cannot eat all our capacity
+        max-wait-duration: 50ms
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        # Liveness must NOT depend on other services: a dependency blip would restart the fleet.
+        liveness:
+          include: livenessState
+        readiness:
+          include: readinessState,db
+  metrics:
+    tags:
+      application: ${spring.application.name}
+  tracing:
+    sampling:
+      probability: ${TRACE_SAMPLING:1.0}
+
+logging:
+  level:
+    dev.orderflow: ${LOG_LEVEL:INFO}
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{correlationId:-no-correlation}] %logger{28} - %msg%n"
+
+---
+spring:
+  config:
+    activate:
+      on-profile: docker

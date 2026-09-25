@@ -1,0 +1,76 @@
+# ---------------------------------------------------------------------------
+# Catalog service configuration.
+#
+# Every value that differs between environments is read from an environment
+# variable with a local default: ${VAR:default}. That is what lets the SAME image
+# run on a laptop, in CI and in production (twelve-factor III, Session 04).
+# ---------------------------------------------------------------------------
+spring:
+  application:
+    name: catalog-service
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/catalog}
+    username: ${DB_USER:catalog}
+    password: ${DB_PASSWORD:dev-catalog-password}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:10}   # per INSTANCE: multiply by replicas (Session 12)
+      minimum-idle: 2
+      connection-timeout: 2000                # fail fast instead of queueing forever
+      max-lifetime: 900000
+      leak-detection-threshold: 20000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate     # Flyway owns the schema. Hibernate only checks it matches.
+    open-in-view: false      # no lazy loading during JSON serialisation
+    properties:
+      hibernate.jdbc.batch_size: 25
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  threads:
+    virtual:
+      enabled: true          # Java 21 virtual threads for request handling (Session 12)
+
+server:
+  port: ${PORT:8081}
+  shutdown: graceful         # finish in-flight requests on SIGTERM (Session 04)
+
+# Application settings, bound to CatalogProperties and validated at startup.
+orderflow:
+  catalog:
+    max-page-size: ${ORDERFLOW_CATALOG_MAX_PAGE_SIZE:100}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true        # /actuator/health/liveness and /readiness for Kubernetes
+      show-details: when_authorized
+  metrics:
+    tags:
+      application: ${spring.application.name}
+  tracing:
+    sampling:
+      probability: ${TRACE_SAMPLING:1.0}      # 1.0 locally, a few percent in production
+
+logging:
+  level:
+    dev.orderflow: ${LOG_LEVEL:INFO}
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{correlationId:-no-correlation}] %logger{28} - %msg%n"
+
+---
+# Profile used inside Docker Compose: the database is reached by SERVICE NAME,
+# never by localhost, because localhost inside a container is that container.
+spring:
+  config:
+    activate:
+      on-profile: docker

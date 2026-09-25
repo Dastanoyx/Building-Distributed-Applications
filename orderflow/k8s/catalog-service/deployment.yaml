@@ -1,0 +1,80 @@
+# ---------------------------------------------------------------------------
+# Session 14 — the catalog service on Kubernetes.
+#
+#   kind create cluster --name orderflow
+#   docker build -f catalog-service/Dockerfile -t orderflow/catalog:dev .
+#   kind load docker-image orderflow/catalog:dev --name orderflow
+#   kubectl apply -f k8s/catalog-service/
+#   kubectl port-forward svc/catalog-service 8081:8081
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog-service
+  labels: { app: catalog-service }
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0        # capacity never drops during a rollout
+  selector:
+    matchLabels: { app: catalog-service }
+  template:
+    metadata:
+      labels: { app: catalog-service }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /actuator/prometheus
+        prometheus.io/port: "8081"
+    spec:
+      containers:
+        - name: app
+          image: orderflow/catalog:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8081
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: k8s
+            - name: DB_URL
+              valueFrom:
+                configMapKeyRef: { name: catalog-config, key: db-url }
+            - name: DB_USER
+              valueFrom:
+                configMapKeyRef: { name: catalog-config, key: db-user }
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: catalog-secrets, key: db-password }
+          resources:
+            requests: { memory: "384Mi", cpu: "200m" }
+            limits:   { memory: "768Mi", cpu: "1000m" }
+
+          # Slow start is not a crash. Without this, the liveness probe kills a JVM that is
+          # still running Flyway, and the pod ends in CrashLoopBackOff.
+          startupProbe:
+            httpGet: { path: /actuator/health/liveness, port: 8081 }
+            failureThreshold: 30
+            periodSeconds: 2
+
+          # Readiness decides WHO GETS TRAFFIC. It may depend on the database, because failing
+          # it only diverts requests to the other pods.
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: 8081 }
+            periodSeconds: 5
+            timeoutSeconds: 3
+
+          # Liveness decides WHO GETS RESTARTED. It must check only this process: wiring it to
+          # a dependency means one database blip restarts the entire fleet at once.
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: 8081 }
+            periodSeconds: 10
+            failureThreshold: 3
+
+          lifecycle:
+            preStop:
+              exec:
+                # Give the load balancer a moment to stop sending traffic before shutdown.
+                command: ["sh", "-c", "sleep 5"]
+      terminationGracePeriodSeconds: 40

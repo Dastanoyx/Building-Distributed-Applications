@@ -1,0 +1,95 @@
+# ---------------------------------------------------------------------------
+# Gateway routes (Session 07).
+#
+# A route = predicates (which requests match) + filters (what to do with them) + a target.
+# Routes are evaluated in order and the first match wins.
+# ---------------------------------------------------------------------------
+spring:
+  application:
+    name: gateway
+
+  cloud:
+    gateway:
+      httpclient:
+        connect-timeout: 500          # milliseconds
+        response-timeout: 3s          # global default; overridden per route below
+
+      default-filters:
+        - AddRequestHeader=X-Gateway, orderflow
+        - DedupeResponseHeader=Access-Control-Allow-Origin
+
+      routes:
+        - id: catalog
+          uri: ${CATALOG_URI:http://localhost:8081}
+          predicates:
+            - Path=/api/products/**,/api/reservations/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: catalogRoute
+                fallbackUri: forward:/fallback/catalog
+
+        - id: orders
+          uri: ${ORDER_URI:http://localhost:8082}
+          predicates:
+            - Path=/api/orders/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: ordersRoute
+                fallbackUri: forward:/fallback/orders
+          metadata:
+            response-timeout: 5000    # placing an order legitimately takes longer
+            connect-timeout: 500
+
+        - id: notifications
+          uri: ${NOTIFICATION_URI:http://localhost:8083}
+          predicates:
+            - Path=/api/notifications/**
+
+        # Old links kept alive without dragging the legacy path through the services.
+        - id: legacy-products
+          uri: no://op
+          predicates:
+            - Path=/products/**
+          filters:
+            - RedirectTo=301, /api/products
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      catalogRoute:
+        sliding-window-size: 20
+        minimum-number-of-calls: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+      ordersRoute:
+        sliding-window-size: 20
+        minimum-number-of-calls: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+
+server:
+  port: ${PORT:8080}
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,gateway
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+logging:
+  level:
+    dev.orderflow: ${LOG_LEVEL:INFO}
+    org.springframework.cloud.gateway: ${GATEWAY_LOG_LEVEL:INFO}
+
+---
+spring:
+  config:
+    activate:
+      on-profile: docker

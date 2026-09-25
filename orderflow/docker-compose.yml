@@ -1,0 +1,201 @@
+# ---------------------------------------------------------------------------
+# OrderFlow — the whole system in one file.
+#
+#   docker compose up -d --build     start everything
+#   docker compose ps                see health
+#   docker compose logs -f order-service
+#   docker compose down              stop (keeps data)
+#   docker compose down -v           stop and delete the databases
+#
+# Only the gateway publishes a port to your machine (8080). The services talk to
+# each other on the private Compose network, by service name — never localhost.
+# Ports 8081-8084 are published as well during the course so you can compare a
+# direct call with a call through the gateway; remove them in Session 14.
+# ---------------------------------------------------------------------------
+name: orderflow
+
+x-service-base: &service-base
+  restart: unless-stopped
+  networks: [orderflow]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+
+  # ----------------------------------------------------------- databases
+  catalog-db:
+    image: postgres:16-alpine
+    <<: *service-base
+    environment:
+      POSTGRES_DB: catalog
+      POSTGRES_USER: catalog
+      POSTGRES_PASSWORD: ${CATALOG_DB_PASSWORD:?set CATALOG_DB_PASSWORD in .env}
+    volumes: [catalog-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U catalog -d catalog"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  order-db:
+    image: postgres:16-alpine
+    <<: *service-base
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: ${ORDER_DB_PASSWORD:?set ORDER_DB_PASSWORD in .env}
+    volumes: [order-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders -d orders"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  notification-db:
+    image: postgres:16-alpine
+    <<: *service-base
+    environment:
+      POSTGRES_DB: notifications
+      POSTGRES_USER: notifications
+      POSTGRES_PASSWORD: ${NOTIFICATION_DB_PASSWORD:?set NOTIFICATION_DB_PASSWORD in .env}
+    volumes: [notification-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notifications -d notifications"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ----------------------------------------------------------- messaging
+  # Kafka in KRaft mode: one broker, no ZooKeeper. Fine for a laptop, never for production
+  # (Session 13 explains what a single broker costs you).
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    <<: *service-base
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://kafka:9092,CONTROLLER://kafka:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      CLUSTER_ID: orderflow-dev-cluster
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:9092", "--list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # ----------------------------------------------------------- services
+  catalog-service:
+    build:
+      context: .
+      dockerfile: catalog-service/Dockerfile
+    <<: *service-base
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      DB_URL: jdbc:postgresql://catalog-db:5432/catalog
+      DB_USER: catalog
+      DB_PASSWORD: ${CATALOG_DB_PASSWORD}
+    ports: ["8081:8081"]
+    depends_on:
+      catalog-db: { condition: service_healthy }
+
+  order-service:
+    build:
+      context: .
+      dockerfile: order-service/Dockerfile
+    <<: *service-base
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      DB_URL: jdbc:postgresql://order-db:5432/orders
+      DB_USER: orders
+      DB_PASSWORD: ${ORDER_DB_PASSWORD}
+      CATALOG_URL: http://catalog-service:8081
+      KAFKA_BOOTSTRAP: kafka:9092
+    ports: ["8082:8082"]
+    depends_on:
+      order-db: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: payment-service/Dockerfile
+    <<: *service-base
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      KAFKA_BOOTSTRAP: kafka:9092
+    ports: ["8084:8084"]
+    depends_on:
+      kafka: { condition: service_healthy }
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: notification-service/Dockerfile
+    <<: *service-base
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      DB_URL: jdbc:postgresql://notification-db:5432/notifications
+      DB_USER: notifications
+      DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD}
+      KAFKA_BOOTSTRAP: kafka:9092
+    ports: ["8083:8083"]
+    depends_on:
+      notification-db: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    <<: *service-base
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      CATALOG_URI: http://catalog-service:8081
+      ORDER_URI: http://order-service:8082
+      NOTIFICATION_URI: http://notification-service:8083
+    ports: ["8080:8080"]
+    depends_on:
+      catalog-service: { condition: service_started }
+      order-service: { condition: service_started }
+
+  # ----------------------------------------------------------- observability
+  prometheus:
+    image: prom/prometheus:v2.53.1
+    <<: *service-base
+    volumes: ["./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.1.4
+    <<: *service-base
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes: ["./ops/grafana/provisioning:/etc/grafana/provisioning:ro"]
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    <<: *service-base
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports: ["16686:16686", "4318:4318"]
+
+volumes:
+  catalog-data:
+  order-data:
+  notification-data:
+
+networks:
+  orderflow:
+    driver: bridge

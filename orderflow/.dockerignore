@@ -1,0 +1,10 @@
+# Keeps the build context small: without this, every `docker build` uploads target/ and .git/
+target/
+**/target/
+.git/
+.idea/
+**/*.iml
+.vscode/
+.env
+docs/
+*.md
